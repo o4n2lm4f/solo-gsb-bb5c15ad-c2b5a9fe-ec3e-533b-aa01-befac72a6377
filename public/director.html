@@ -112,7 +112,7 @@
       } else {
         seqTable.innerHTML = state.sequence.map((c, i) => {
           const cur = state.phase === 'active' && i === state.currentIndex;
-          return `<tr class="${cur ? 'current-row' : ''}"><td>${c.seq}</td>` +
+          return `<tr class="${cur ? 'current-row' : ''}"><td>${c.seq}${CueClient.revisionBadge(c)}</td>` +
             `<td>${CueClient.escapeHtml(c.text)}</td>` +
             `<td>${c.targets.map((t) => `<span class="chip">${CueClient.escapeHtml(t)}</span>`).join('')}</td></tr>`;
         }).join('');

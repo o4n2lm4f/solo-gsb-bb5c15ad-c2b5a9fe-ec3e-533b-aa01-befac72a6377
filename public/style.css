@@ -153,6 +153,51 @@ tr.current-row td { background: #24304a; }
 
 .countdown { font-size: 15px; color: #f0c169; text-align: center; margin-top: 6px; }
 .muted { color: #7c8398; font-size: 13px; }
+
+/* 撤回并纠正重发 */
+.rev-badge {
+  display: inline-block;
+  padding: 1px 9px;
+  margin-left: 6px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 500;
+  background: #4a3a1e;
+  color: #f0c169;
+  vertical-align: middle;
+}
+.rev-reason {
+  margin-top: 4px;
+  font-size: 14px;
+  color: #f0c169;
+  line-height: 1.6;
+}
+.revise-form { display: flex; flex-direction: column; gap: 8px; }
+.revise-form .row { margin: 4px 0 0; }
+.rev-current {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: #14161c;
+  border-radius: 6px;
+}
+.rev-item {
+  border: 1px solid #2c3040;
+  border-left: 3px solid #4a3a1e;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  background: #1a1d27;
+}
+.rev-item-head { font-size: 13px; color: #aab2c5; margin-bottom: 6px; }
+.rev-item-head code { font-size: 11px; color: #8ab4ff; }
+.rev-item-time { float: right; color: #5d6478; font-size: 12px; }
+.rev-item-text { font-size: 14px; margin: 4px 0; }
+.rev-item-reason { font-size: 13px; color: #f0c169; margin: 4px 0 8px; }
+.rev-item-row { font-size: 13px; margin: 4px 0; }
 .home-links { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .home-links a {
   display: block;

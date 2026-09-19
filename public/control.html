@@ -26,6 +26,26 @@
       <div class="countdown" id="countdown"></div>
     </div>
 
+    <div class="card" id="reviseCard" style="display:none">
+      <h2>撤回并纠正重发</h2>
+      <div class="revise-form" id="reviseForm">
+        <label class="muted">撤回原因（必填，将随修订号实时展示给各岗位）</label>
+        <input type="text" id="reviseReason" maxlength="500" placeholder="如：口令文本有误 / 目标岗位需要调整说明">
+        <label class="muted">修正版口令文本（必填，同一序号以新修订号重新发出）</label>
+        <input type="text" id="reviseText" maxlength="500" placeholder="输入修正后的完整口令内容">
+        <div class="row">
+          <button class="danger narrow" id="btnRevise">↻ 撤回并纠正重发</button>
+        </div>
+        <p class="muted">撤回后：旧轮次的确认、超时、替岗与截止时间立即封存为只读历史；同一序号创建递增修订号并清空本轮状态，重新开始<b>完整确认时限</b>。旧轮次确认与旧定时器回调一律拒绝并记录。已推进或已完成的口令不可撤回。</p>
+      </div>
+    </div>
+
+    <div class="card" id="revHistCard" style="display:none">
+      <h2>本口令修订历史（旧轮次只读封存）</h2>
+      <div id="revCurrent" class="rev-current"></div>
+      <div id="revHistory"></div>
+    </div>
+
     <div class="card">
       <h2>目标岗位确认状态</h2>
       <div id="targets"><span class="muted">—</span></div>
@@ -70,6 +90,13 @@
     const btnStart = document.getElementById('btnStart');
     const btnAdvance = document.getElementById('btnAdvance');
     const btnReset = document.getElementById('btnReset');
+    const btnRevise = document.getElementById('btnRevise');
+    const reviseCard = document.getElementById('reviseCard');
+    const reviseReason = document.getElementById('reviseReason');
+    const reviseText = document.getElementById('reviseText');
+    const revHistCard = document.getElementById('revHistCard');
+    const revCurrentEl = document.getElementById('revCurrent');
+    const revHistoryEl = document.getElementById('revHistory');
 
     let toastTimer = null;
     let lastState = null;
@@ -89,6 +116,17 @@
       if (confirm('确定重置本场？当前口令进度将清空（日志保留）。')) {
         client.send({ type: 'reset' });
       }
+    };
+    // 撤回并纠正重发：仅控制端可填写撤回原因与修正版口令文本
+    btnRevise.onclick = () => {
+      const reason = reviseReason.value.trim();
+      const text = reviseText.value.trim();
+      if (!reason) return showToast('请填写撤回原因');
+      if (!text) return showToast('请填写修正版口令文本');
+      if (!confirm(`确认撤回第 ${lastState.currentCue.seq} 条口令并以修订 #${(lastState.currentCue.revision || 1) + 1} 重发？\n旧轮次确认将全部封存作废。`)) return;
+      client.send({ type: 'revise', reason, text });
+      reviseReason.value = '';
+      reviseText.value = '';
     };
 
     function targetChip(state, t, opts = {}) {
@@ -180,9 +218,15 @@
 
       // 当前口令
       if (active && cue) {
+        const revision = cue.revision || 1;
         cueArea.innerHTML =
-          `<div class="big-cue"><span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条</span>` +
-          `${CueClient.escapeHtml(cue.text)}</div>`;
+          `<div class="big-cue"><span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条` +
+          ` · 当前修订号 ${revision} ${CueClient.revisionBadge(cue)}</span>` +
+          `${CueClient.escapeHtml(cue.text)}</div>` +
+          (revision > 1
+            ? `<p class="rev-reason" style="text-align:center">↻ 撤回原因：${CueClient.escapeHtml(cue.revisionReason || '')}　` +
+              `<span class="muted">当前 attemptId：<code>${CueClient.escapeHtml((state.attemptId || '').slice(0, 8))}</code></span></p>`
+            : '');
       } else if (state.phase === 'done') {
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">本场演出序列已全部完成</p>';
       } else {
@@ -209,6 +253,27 @@
       }
       renderSubPanel(state);
 
+      // 撤回并纠正重发面板：仅在口令进行中可用（已推进/已完成的口令不可撤回）
+      reviseCard.style.display = active ? '' : 'none';
+      if (active && cue) {
+        btnRevise.disabled = false;
+        if (!reviseText.value) reviseText.placeholder = `修正版口令（当前：${cue.text}）`;
+      }
+
+      // 修订历史：当前修订号/原因 + 旧轮次只读封存结果
+      if (active && cue && cue.history && cue.history.length > 0) {
+        revHistCard.style.display = '';
+        revCurrentEl.innerHTML =
+          `<span class="rev-badge">当前修订 #${cue.revision}</span>` +
+          `<span class="muted">撤回原因：${CueClient.escapeHtml(cue.revisionReason || '')}</span>` +
+          `<span class="muted">当前 attemptId：<code>${CueClient.escapeHtml((state.attemptId || '').slice(0, 8))}</code></span>`;
+        revHistoryEl.innerHTML = CueClient.renderRevisionHistory(cue);
+      } else {
+        revHistCard.style.display = 'none';
+        revCurrentEl.innerHTML = '';
+        revHistoryEl.innerHTML = '';
+      }
+
       // 序列进度
       if (state.sequence.length === 0) {
         seqTable.innerHTML = '<tr><td colspan="4" class="muted">尚未创建序列</td></tr>';
@@ -219,7 +284,7 @@
           else if (active && i === state.currentIndex) status = '<span class="chip late">进行中</span>';
           else status = '<span class="chip">待执行</span>';
           const cur = active && i === state.currentIndex;
-          return `<tr class="${cur ? 'current-row' : ''}"><td>${c.seq}</td>` +
+          return `<tr class="${cur ? 'current-row' : ''}"><td>${c.seq}${CueClient.revisionBadge(c)}</td>` +
             `<td>${CueClient.escapeHtml(c.text)}</td>` +
             `<td>${c.targets.map((t) => `<span class="chip">${CueClient.escapeHtml(t)}</span>`).join('')}</td>` +
             `<td>${status}</td></tr>`;

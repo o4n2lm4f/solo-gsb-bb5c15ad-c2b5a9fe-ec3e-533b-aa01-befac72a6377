@@ -36,6 +36,12 @@
       <div class="countdown" id="countdown"></div>
     </div>
 
+    <div class="card" id="revInfoCard" style="display:none">
+      <h2>本口令修订记录</h2>
+      <div id="revCurrent" class="rev-current"></div>
+      <div id="revHistory"></div>
+    </div>
+
     <div class="card" style="text-align:center">
       <button id="btnConfirm" style="font-size:22px;padding:18px 64px" disabled>✔ 确认收到</button>
       <p class="muted" style="margin-top:10px" id="confirmHint">仅当本岗位是当前口令的有效目标（含临时替岗接管）时可确认</p>
@@ -58,9 +64,13 @@
     const btnConfirm = document.getElementById('btnConfirm');
     const confirmHint = document.getElementById('confirmHint');
     const positionInput = document.getElementById('positionName');
+    const revInfoCard = document.getElementById('revInfoCard');
+    const revCurrentEl = document.getElementById('revCurrent');
+    const revHistoryEl = document.getElementById('revHistory');
 
     let toastTimer = null;
     let countdownTimer = null;
+    let lastState = null;
     let myPosition = localStorage.getItem('cuePosition') || '';
     positionInput.value = myPosition;
 
@@ -80,11 +90,20 @@
       showToast(`已上岗：${name}`);
     };
 
-    btnConfirm.onclick = () => client.send({ type: 'confirm' });
+    // 确认消息必须携带当前快照中的 attemptId；旧轮次确认会被服务端拒绝并记录
+    btnConfirm.onclick = () => {
+      if (lastState && lastState.attemptId) {
+        client.send({ type: 'confirm', attemptId: lastState.attemptId });
+      } else {
+        showToast('状态同步中，请稍后再确认');
+      }
+    };
 
     function render(state) {
+      lastState = state;
       const active = state.phase === 'active';
       const cue = state.currentCue;
+      const revision = cue ? cue.revision || 1 : 1;
       const subs = state.substitutions || {};
       // 有效目标含临时替岗：被接管的原岗位不再可确认，替补可确认
       const effTargets = state.effectiveTargets || (cue ? cue.targets : []);
@@ -99,7 +118,10 @@
 
       // 横幅
       banner.className = 'status-banner';
-      if (myConf && myConf.late) {
+      if (revision > 1) {
+        banner.classList.add('show', 'warn');
+        banner.textContent = `↻ 当前为第 ${revision} 次修订版口令（撤回原因：${cue.revisionReason}），请按最新口令重新确认`;
+      } else if (myConf && myConf.late) {
         banner.classList.add('show', 'warn');
         banner.textContent = '⚠ 已迟到确认（超过确认时限）';
       } else if (myConf) {
@@ -118,9 +140,13 @@
 
       // 口令展示
       if (active && cue) {
-        const head = `<span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条</span>`;
+        const head = `<span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条` +
+          ` · 当前修订号 ${revision}</span>`;
         let note = '';
-        if (!targeted) {
+        if (revision > 1) {
+          note = `<p class="rev-reason">↻ 撤回原因：${CueClient.escapeHtml(cue.revisionReason || '')}` +
+            `（旧轮次确认已全部作废，需按本修订版重新确认；新确认倒计时已重新开始）</p>`;
+        } else if (!targeted) {
           note = replacedBy
             ? `<p class="muted" style="text-align:center">本条口令的确认任务已移交「${CueClient.escapeHtml(replacedBy)}」，本岗位无需操作</p>`
             : '<p class="muted" style="text-align:center">本条口令不涉及本岗位，无需操作</p>';
@@ -132,6 +158,20 @@
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">本场演出序列已全部完成</p>';
       } else {
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">等待控制端发出口令</p>';
+      }
+
+      // 修订记录：当前修订号、修订原因与旧轮次封存结果（断线重连后同样一致）
+      if (active && cue && revision > 1) {
+        revInfoCard.style.display = '';
+        revCurrentEl.innerHTML =
+          `<span class="rev-badge">修订 #${revision}</span>` +
+          `<span class="muted">撤回原因：${CueClient.escapeHtml(cue.revisionReason || '')}</span>` +
+          `<span class="muted">当前轮次 attemptId：<code>${CueClient.escapeHtml((state.attemptId || '').slice(0, 8))}</code></span>`;
+        revHistoryEl.innerHTML = CueClient.renderRevisionHistory(cue);
+      } else {
+        revInfoCard.style.display = 'none';
+        revCurrentEl.innerHTML = '';
+        revHistoryEl.innerHTML = '';
       }
 
       // 确认按钮：仅有效目标（含替补）且未确认时可点
