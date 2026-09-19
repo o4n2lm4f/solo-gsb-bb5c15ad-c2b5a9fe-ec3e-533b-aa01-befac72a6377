@@ -42,6 +42,11 @@
     </div>
 
     <div class="card">
+      <h2>本条口令修订档案（旧轮次只读历史）</h2>
+      <div id="attempts"><span class="muted">—</span></div>
+    </div>
+
+    <div class="card">
       <h2>本场事件日志</h2>
       <div class="log-box" id="log"><span class="muted">暂无事件</span></div>
     </div>
@@ -54,6 +59,7 @@
     const cueArea = document.getElementById('cueArea');
     const countdownEl = document.getElementById('countdown');
     const logEl = document.getElementById('log');
+    const attemptsEl = document.getElementById('attempts');
     const toast = document.getElementById('toast');
     const btnConfirm = document.getElementById('btnConfirm');
     const confirmHint = document.getElementById('confirmHint');
@@ -80,12 +86,20 @@
       showToast(`已上岗：${name}`);
     };
 
-    btnConfirm.onclick = () => client.send({ type: 'confirm' });
+    let lastState = null;
+    btnConfirm.onclick = () => {
+      // 必须携带当前快照中的 attemptId；口令被撤回后，旧轮次确认会被服务端拒绝
+      if (lastState && lastState.attemptId) {
+        client.send({ type: 'confirm', attemptId: lastState.attemptId });
+      }
+    };
 
     function render(state) {
+      lastState = state;
       const active = state.phase === 'active';
       const cue = state.currentCue;
       const subs = state.substitutions || {};
+      const revision = state.revision || 1;
       // 有效目标含临时替岗：被接管的原岗位不再可确认，替补可确认
       const effTargets = state.effectiveTargets || (cue ? cue.targets : []);
       const targeted = active && cue && myPosition && effTargets.includes(myPosition);
@@ -97,9 +111,12 @@
         : null;
       const replacedBy = active && cue && subs[myPosition] ? subs[myPosition].substitute : null;
 
-      // 横幅
+      // 横幅（修订重发优先提示：撤回后本轮状态已清空，需按新版本重新确认）
       banner.className = 'status-banner';
-      if (myConf && myConf.late) {
+      if (revision > 1) {
+        banner.classList.add('show', 'warn');
+        banner.textContent = `↩ 口令已撤回并修订重发（当前第 ${revision} 版），请按下方最新口令重新确认`;
+      } else if (myConf && myConf.late) {
         banner.classList.add('show', 'warn');
         banner.textContent = '⚠ 已迟到确认（超过确认时限）';
       } else if (myConf) {
@@ -116,9 +133,14 @@
         banner.textContent = `本条口令的确认任务已移交「${replacedBy}」，本岗位无需操作`;
       }
 
-      // 口令展示
+      // 口令展示（含当前修订号与撤回原因）
       if (active && cue) {
-        const head = `<span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条</span>`;
+        const revBadge = revision > 1
+          ? `<span class="rev-badge">当前修订：第 ${revision} 版</span>`
+          : '<span class="rev-badge rev-initial">第 1 版（原始口令）</span>';
+        const head = `<span class="cue-seq">第 ${cue.seq} 条 / 共 ${state.sequence.length} 条</span>${revBadge}`;
+        const reasonLine = revision > 1 && state.revisionReason
+          ? `<p class="rev-reason">撤回原因：${CueClient.escapeHtml(state.revisionReason)}</p>` : '';
         let note = '';
         if (!targeted) {
           note = replacedBy
@@ -127,11 +149,19 @@
         } else if (subbedFor) {
           note = `<p class="muted" style="text-align:center">⚑ 本岗位临时接管「${CueClient.escapeHtml(subbedFor)}」的确认任务</p>`;
         }
-        cueArea.innerHTML = `<div class="big-cue">${head}${CueClient.escapeHtml(cue.text)}</div>${note}`;
+        cueArea.innerHTML = `<div class="big-cue">${head}${CueClient.escapeHtml(cue.text)}</div>${reasonLine}${note}`;
       } else if (state.phase === 'done') {
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">本场演出序列已全部完成</p>';
       } else {
         cueArea.innerHTML = '<p class="muted" style="text-align:center;padding:24px">等待控制端发出口令</p>';
+      }
+
+      // 本条口令只读旧轮次历史
+      if (active && cue && state.cueHistory && state.cueHistory[cue.id]) {
+        const html = CueClient.renderAttempts(state.cueHistory[cue.id], cue);
+        attemptsEl.innerHTML = html || '<span class="muted">本条口令尚无被撤回的旧轮次</span>';
+      } else {
+        attemptsEl.innerHTML = '<span class="muted">—</span>';
       }
 
       // 确认按钮：仅有效目标（含替补）且未确认时可点

@@ -42,6 +42,8 @@ function client(role, position) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 岗位确认必须携带其最新快照中的 attemptId（与岗位端页面行为一致）
+const confirmCue = (c) => c.send({ type: 'confirm', attemptId: c.state.attemptId });
 
 (async () => {
   const director = client('director');
@@ -72,16 +74,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('第 1 条口令激活', st.currentCue.text === '灯光渐暗');
 
   console.log('3. 非目标岗位确认应被拒绝');
-  sound.send({ type: 'confirm' });
+  confirmCue(sound);
   await sleep(200);
   check('音响确认被拒绝', sound.errors.some((e) => e.includes('不涉及')));
   check('确认状态未串入', Object.keys(st.confirmations || {}).length === 0);
 
   console.log('4. 目标岗位确认 + 重复确认标记');
-  light.send({ type: 'confirm' });
+  confirmCue(light);
   st = await control.waitState((s) => s.confirmations['灯光']);
   check('灯光确认成功', !!st.confirmations['灯光']);
-  light.send({ type: 'confirm' });
+  confirmCue(light);
   st = await control.waitState((s) => s.log.some((l) => l.event === 'confirm-duplicate'));
   check('重复确认被实时标记进日志', true);
 
@@ -92,7 +94,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('上一条确认未串入下一条', Object.keys(st.confirmations).length === 0);
 
   console.log('6. 未全员确认禁止推进');
-  sound.send({ type: 'confirm' });
+  confirmCue(sound);
   await control.waitState((s) => s.confirmations['音响']);
   control.send({ type: 'advance' });
   await sleep(200);
@@ -121,7 +123,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     !!subLog && subLog.detail.from === '道具' && subLog.detail.to === '灯光' && !!subLog.ts);
 
   console.log('9. 原岗位不得再确认本条');
-  prop.send({ type: 'confirm' });
+  confirmCue(prop);
   await sleep(200);
   check('道具确认被拒绝', prop.errors.some((e) => e.includes('移交')));
   check('道具未产生确认记录', !control.state.confirmations['道具']);
@@ -141,7 +143,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('原岗位（道具）不在超时列表', !st.timedOut.includes('道具'));
 
   console.log('12. 替补确认计入全员确认（迟到）');
-  light2.send({ type: 'confirm' });
+  confirmCue(light2);
   st = await control.waitState((s) => s.confirmations['灯光']);
   check('替补迟到确认被接受且标记 late', st.confirmations['灯光'].late === true);
   check('日志含替补的 confirm-late', st.log.some((l) => l.event === 'confirm-late' && l.detail.position === '灯光'));
@@ -155,8 +157,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check('确认不串入下一条', Object.keys(st.confirmations).length === 0);
 
   console.log('14. 推进至完成');
-  light2.send({ type: 'confirm' });
-  sound.send({ type: 'confirm' });
+  confirmCue(light2);
+  confirmCue(sound);
   await control.waitState((s) => s.confirmations['灯光'] && s.confirmations['音响']);
   control.send({ type: 'advance' });
   st = await control.waitState((s) => s.phase === 'done');
@@ -167,6 +169,125 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   st = await director.waitState((s) => s.phase === 'idle');
   check('重置回 idle', true);
   check('事件日志保留', st.log.length > 5);
+
+  console.log('16. 撤回权限与参数校验');
+  director.send({ type: 'setSequence', timeoutSec: 3, cues: [
+    { text: '第一版口令', targets: ['灯光', '音响'] },
+    { text: '下一条', targets: ['道具'] },
+  ]});
+  await control.waitState((s) => s.sequence.length === 2);
+  control.send({ type: 'start' });
+  st = await control.waitState((s) => s.phase === 'active' && s.currentCue.text === '第一版口令');
+  check('新序列开始，初始修订号为 1', st.revision === 1 && !st.revisionReason);
+  const firstAttemptId = st.attemptId;
+  check('快照携带 attemptId', typeof firstAttemptId === 'string' && firstAttemptId.length > 0);
+  light2.send({ type: 'recall', reason: 'x', text: 'y' }); // 岗位端无权撤回
+  control.send({ type: 'recall', reason: '', text: '修正版' }); // 缺撤回原因
+  control.send({ type: 'recall', reason: '口令有误', text: '  ' }); // 缺修正版文本
+  await sleep(300);
+  check('非控制端撤回被拒绝', light2.errors.some((e) => e.includes('仅控制端')));
+  check('缺撤回原因被拒绝', control.errors.some((e) => e.includes('撤回原因')));
+  check('缺修正版文本被拒绝', control.errors.some((e) => e.includes('修正版口令文本')));
+  check('拒绝后修订号仍为 1', control.state.revision === 1);
+
+  console.log('17. 旧轮次确认后撤回并纠正重发');
+  light2.send({ type: 'confirm', attemptId: firstAttemptId });
+  st = await control.waitState((s) => s.confirmations['灯光']);
+  check('灯光在第 1 版确认成功', st.confirmations['灯光'].attemptId === firstAttemptId);
+  const oldDeadline = st.deadline;
+  await sleep(100);
+  control.send({ type: 'recall', reason: '口令措辞有误', text: '第二版口令（修正）' });
+  st = await control.waitState((s) => s.revision === 2);
+  check('修订号递增为 2', st.revision === 2);
+  check('当前口令文本已替换', st.currentCue.text === '第二版口令（修正）');
+  check('修订原因已下发', st.revisionReason === '口令措辞有误');
+  check('生成新的 attemptId', st.attemptId !== firstAttemptId);
+  check('本轮确认状态已清空', Object.keys(st.confirmations).length === 0);
+  check('本轮超时/替岗状态已清空', st.timedOut.length === 0 && Object.keys(st.substitutions).length === 0);
+  check('确认时限重新开始（deadline 晚于旧轮次）', st.deadline > oldDeadline);
+  const hist = st.cueHistory[st.currentCue.id];
+  check('旧轮次已封存为只读历史', !!hist && hist.attempts.length === 1 && hist.attempts[0].endState === 'recalled');
+  const archived = hist.attempts[0];
+  check('封存内容保留旧轮次确认/截止时间/撤回原因',
+    archived.confirmations['灯光'] && archived.confirmations['灯光'].attemptId === firstAttemptId &&
+    archived.deadline === oldDeadline && archived.reason === '口令措辞有误' &&
+    archived.text === '第一版口令' && archived.revision === 1);
+  check('cue-recalled 与 cue-resent 均写入日志',
+    st.log.some((l) => l.event === 'cue-recalled' && l.detail.newRevision === 2) &&
+    st.log.some((l) => l.event === 'cue-resent' && l.detail.revision === 2));
+
+  console.log('18. 旧轮次迟到确认只能被拒绝，绝不污染新轮次');
+  light2.send({ type: 'confirm', attemptId: firstAttemptId }); // 使用快照中的旧 attemptId
+  await sleep(300);
+  check('旧轮次确认被拒绝', light2.errors.some((e) => e.includes('旧轮次')));
+  st = control.state;
+  check('新轮次确认表未被污染', Object.keys(st.confirmations).length === 0);
+  check('stale-confirm-ignored 已记录',
+    st.log.some((l) => l.event === 'stale-confirm-ignored' &&
+      l.detail.sentAttemptId === firstAttemptId && l.detail.position === '灯光'));
+  light2.send({ type: 'confirm', attemptId: null }); // 不带 attemptId 同样拒绝
+  await sleep(200);
+  check('缺少 attemptId 的确认被拒绝', light2.errors.some((e) => e.includes('旧轮次')));
+
+  console.log('19. 旧轮次定时器回调被拒绝，不触发新轮次超时');
+  // 第 1 版在演出开始后 3 秒到期；撤回发生在到期前，旧回调触发时只记录 stale-timeout-ignored
+  st = await control.waitState(
+    (s) => s.log.some((l) => l.event === 'stale-timeout-ignored' && l.detail.staleAttemptId === firstAttemptId),
+    3000);
+  check('旧定时器回调被拒绝并记录',
+    st.log.some((l) => l.event === 'stale-timeout-ignored' &&
+      l.detail.staleAttemptId === firstAttemptId &&
+      l.detail.staleRevision === 1 &&
+      l.detail.currentAttemptId !== firstAttemptId));
+  check('旧回调未污染当前进行轮次的超时表',
+    !control.state.timedOut.includes('灯光') || control.state.revision >= 2);
+
+  console.log('20. 断线重连后修订号/原因/旧轮次结果一致');
+  const sound2 = client('position', '音响');
+  await sound2.ready;
+  st = await sound2.waitState((s) => s.revision === 2 && s.cueHistory[s.currentCue.id]);
+  check('重连后恢复修订号与原因', st.revision === 2 && st.revisionReason === '口令措辞有误');
+  check('重连后恢复只读旧轮次结果',
+    st.cueHistory[st.currentCue.id].attempts[0].confirmations['灯光']);
+
+  console.log('21. 连续撤回：修订号继续递增，历史逐版只读封存');
+  control.send({ type: 'recall', reason: '再次更正目标动作', text: '第三版口令' });
+  st = await control.waitState((s) => s.revision === 3);
+  check('修订号递增为 3，原因更新', st.revisionReason === '再次更正目标动作');
+  check('两版旧轮次均封存只读',
+    st.cueHistory[st.currentCue.id].attempts.length === 2 &&
+    st.cueHistory[st.currentCue.id].attempts[0].revision === 1 &&
+    st.cueHistory[st.currentCue.id].attempts[1].revision === 2 &&
+    st.cueHistory[st.currentCue.id].attempts[1].reason === '再次更正目标动作');
+  check('封存对象互不串改（第 1 版保留其撤回原因）',
+    st.cueHistory[st.currentCue.id].attempts[0].reason === '口令措辞有误');
+
+  console.log('22. 全员确认后不可撤回，但可正常推进封存');
+  const thirdAttemptId = st.attemptId;
+  light2.send({ type: 'confirm', attemptId: thirdAttemptId });
+  sound2.send({ type: 'confirm', attemptId: thirdAttemptId });
+  st = await control.waitState((s) => s.confirmations['灯光'] && s.confirmations['音响']);
+  control.send({ type: 'recall', reason: '试图撤回已完成口令', text: '不应生效' });
+  await sleep(300);
+  check('全员确认后撤回被拒绝', control.errors.some((e) => e.includes('已全员确认完成')));
+  check('口令文本未被改动', control.state.currentCue.text === '第三版口令');
+  control.send({ type: 'advance' });
+  st = await control.waitState((s) => s.currentCue && s.currentCue.seq === 2);
+  check('推进到下一条，修订号重置', st.revision === 1 && !st.revisionReason);
+  check('完成轮次以 completed 封存', (() => {
+    const prev = st.cueHistory[st.sequence[0].id];
+    return prev && prev.attempts.some((a) => a.endState === 'completed' && a.revision === 3);
+  })());
+  check('新轮次确认表干净', Object.keys(st.confirmations).length === 0);
+
+  console.log('23. 已完成（done）场次不可撤回');
+  prop.send({ type: 'confirm', attemptId: st.attemptId });
+  await control.waitState((s) => s.confirmations['道具']);
+  control.send({ type: 'advance' });
+  st = await control.waitState((s) => s.phase === 'done');
+  control.send({ type: 'recall', reason: '演出已结束', text: 'x' });
+  await sleep(200);
+  check('done 后撤回被拒绝', control.errors.some((e) => e.includes('已推进或已完成')));
 
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   process.exit(failed ? 1 : 0);

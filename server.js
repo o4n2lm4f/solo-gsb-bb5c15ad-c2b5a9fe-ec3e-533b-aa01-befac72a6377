@@ -23,9 +23,12 @@ const state = {
   sequence: [], // [{ id, seq, text, targets: [string] }]
   timeoutSec: DEFAULT_TIMEOUT_SEC,
   currentIndex: -1,
-  confirmations: {}, // position -> { clientId, at, late }
-  timedOut: [], // 超时未确认的岗位
-  substitutions: {}, // 当前口令的临时替岗：原岗位 -> { substitute, at }，仅对本条口令生效
+  attemptId: null, // 当前轮次（某次激活/某次修订重发）的唯一凭证，岗位确认必须原样带回
+  // 每个口令的修订档案：cueId -> { revision, currentReason, attempts: [只读历史轮次] }
+  cueHistory: {},
+  confirmations: {}, // 当前轮次：position -> { clientId, at, late, attemptId }
+  timedOut: [], // 当前轮次：超时未确认的岗位
+  substitutions: {}, // 当前轮次的临时替岗：原岗位 -> { substitute, at }，仅对本轮次生效
   cueStartedAt: null,
   deadline: null,
   log: [], // [{ ts, event, detail }]
@@ -50,6 +53,29 @@ function currentCue() {
   return state.sequence[state.currentIndex] || null;
 }
 
+// 某条口令的修订档案（修订号、修订原因、只读历史轮次）
+function cueHistoryOf(cue) {
+  if (!cue) return null;
+  return state.cueHistory[cue.id] || null;
+}
+
+// 冻结当前轮次快照为只读历史（撤回/推进封存时使用，深拷贝确保之后无法被修改）
+function snapshotCurrentAttempt(cue, endState, reason) {
+  return {
+    attemptId: state.attemptId,
+    revision: cueHistoryOf(cue) ? cueHistoryOf(cue).revision : 1,
+    text: cue.text,
+    startedAt: state.cueStartedAt,
+    deadline: state.deadline,
+    endedAt: Date.now(),
+    endState, // completed（全员确认后推进封存） | recalled（撤回纠正重发）
+    reason: reason || null, // endState === recalled 时为撤回原因
+    confirmations: structuredClone(state.confirmations),
+    timedOut: structuredClone(state.timedOut),
+    substitutions: structuredClone(state.substitutions),
+  };
+}
+
 // 当前口令的有效目标：被替岗的原岗位由其替补顶替，仅对当前口令生效
 function effectiveTargets(cue) {
   if (!cue) return [];
@@ -67,17 +93,23 @@ function allConfirmed() {
 
 // 断线重连恢复依赖全量状态快照：任何变化都广播完整公开状态
 function publicState() {
+  const cue = currentCue();
+  const hist = cueHistoryOf(cue);
   return {
     sessionId: state.sessionId,
     phase: state.phase,
     sequence: state.sequence,
     timeoutSec: state.timeoutSec,
     currentIndex: state.currentIndex,
-    currentCue: currentCue(),
+    currentCue: cue,
+    attemptId: state.attemptId,
+    revision: hist ? hist.revision : 1,
+    revisionReason: hist && hist.revision > 1 ? hist.currentReason : null,
+    cueHistory: state.cueHistory,
     confirmations: state.confirmations,
     timedOut: state.timedOut,
     substitutions: state.substitutions,
-    effectiveTargets: effectiveTargets(currentCue()),
+    effectiveTargets: effectiveTargets(cue),
     cueStartedAt: state.cueStartedAt,
     deadline: state.deadline,
     serverNow: Date.now(),
@@ -127,30 +159,91 @@ function clearCueTimer() {
   }
 }
 
-function activateCue(index) {
-  clearCueTimer();
-  state.currentIndex = index;
+// 开启一轮全新确认时限（首次激活或撤回后修订重发均经此入口）。
+// attemptId 为本轮唯一凭证；确认/超时/替岗/截止时间只属于本轮，绝不带入新轮次。
+// cancelOldTimer=false（撤回场景）时不清除旧轮次定时器：让其到期后凭 attemptId 被拒绝并记录，
+// 即“迟到的旧定时器回调只能被拒绝、绝不污染新轮次”；正常推进/重置仍直接取消旧定时器。
+function startRound(cue, revision, startLog, { cancelOldTimer = true } = {}) {
+  if (cancelOldTimer) clearCueTimer();
+  // 确保该口令存在修订档案（第 1 版开始时建立；attempts 仅在封存时追加）
+  if (!state.cueHistory[cue.id]) {
+    state.cueHistory[cue.id] = { revision: 1, currentReason: null, attempts: [] };
+  }
+  state.attemptId = crypto.randomUUID();
   state.phase = 'active';
-  // 关键：每条口令的确认/超时/替岗状态独立，绝不串入下一条（下一条仍用导演编排的原目标）
+  // 关键：每轮的确认/超时/替岗状态独立，绝不串入下一轮/下一条（下一条仍用导演编排的原目标）
   state.confirmations = {};
   state.timedOut = [];
   state.substitutions = {};
   state.cueStartedAt = Date.now();
   state.deadline = state.cueStartedAt + state.timeoutSec * 1000;
 
-  const cue = currentCue();
-  addLog('cue-started', { seq: cue.seq, text: cue.text, targets: cue.targets });
+  const attemptId = state.attemptId;
+  if (startLog) {
+    addLog(startLog.event, { ...startLog.detail, revision, attemptId });
+  }
 
   timeoutTimer = setTimeout(() => {
     const cueNow = currentCue();
-    if (!cueNow || cueNow.id !== cue.id) return; // 已推进，忽略旧定时器
+    // 旧轮次定时器回调：轮次已撤回/口令已推进，只记录、拒绝，绝不污染新轮次
+    if (!cueNow || cueNow.id !== cue.id || state.attemptId !== attemptId) {
+      addLog('stale-timeout-ignored', {
+        seq: cue.seq,
+        staleRevision: revision,
+        staleAttemptId: attemptId,
+        currentAttemptId: state.attemptId,
+      });
+      broadcastState();
+      return;
+    }
     const missing = effectiveTargets(cueNow).filter((t) => !state.confirmations[t]);
     if (missing.length === 0) return;
     state.timedOut = missing;
-    addLog('cue-timeout', { seq: cueNow.seq, missing });
+    addLog('cue-timeout', { seq: cueNow.seq, revision, attemptId, missing });
     broadcastState();
   }, state.timeoutSec * 1000);
+}
 
+function activateCue(index) {
+  state.currentIndex = index;
+  state.phase = 'active';
+  const cue = state.sequence[index];
+  startRound(cue, 1, { event: 'cue-started', detail: { seq: cue.seq, text: cue.text, targets: cue.targets } });
+  broadcastState();
+}
+
+// 撤回并纠正重发：封存旧轮次为只读历史 → 替换口令文本、递增修订号 → 清空本轮状态并重新开始完整确认时限
+function recallCue(ws, reason, newText) {
+  const cue = currentCue();
+  if (!cue) return sendError(ws, '当前没有进行中的口令，无法撤回');
+
+  const hist = state.cueHistory[cue.id] || { revision: 1, currentReason: null, attempts: [] };
+  const oldRevision = hist.revision;
+  const oldAttemptId = state.attemptId;
+
+  // 先封存旧轮次（在修改口令文本之前快照），旧轮次此后只读
+  hist.attempts.push(snapshotCurrentAttempt(cue, 'recalled', reason));
+
+  cue.text = newText;
+  hist.revision = oldRevision + 1;
+  hist.currentReason = reason;
+  state.cueHistory[cue.id] = hist;
+
+  addLog('cue-recalled', {
+    seq: cue.seq,
+    oldRevision,
+    newRevision: hist.revision,
+    oldAttemptId,
+    reason,
+    newText,
+  });
+
+  // 清空本轮状态并重新开始完整确认时限。
+  // 不取消旧轮次定时器：它到期后凭 attemptId 被拒绝并记录（旧回调先于新截止时间触发）。
+  startRound(cue, hist.revision, {
+    event: 'cue-resent',
+    detail: { seq: cue.seq, text: newText, reason },
+  }, { cancelOldTimer: false });
   broadcastState();
 }
 
@@ -158,6 +251,10 @@ function finishSequence() {
   clearCueTimer();
   state.phase = 'done';
   state.currentIndex = state.sequence.length;
+  state.attemptId = null;
+  state.confirmations = {};
+  state.timedOut = [];
+  state.substitutions = {};
   state.cueStartedAt = null;
   state.deadline = null;
   addLog('sequence-finished', {});
@@ -225,6 +322,8 @@ function handleMessage(ws, msg) {
           ? Math.round(timeoutSec)
           : DEFAULT_TIMEOUT_SEC;
       state.currentIndex = -1;
+      state.attemptId = null;
+      state.cueHistory = {};
       addLog('sequence-set', {
         count: state.sequence.length,
         timeoutSec: state.timeoutSec,
@@ -251,7 +350,12 @@ function handleMessage(ws, msg) {
         return sendError(ws, `以下岗位尚未确认，禁止推进：${missing.join('、')}`);
       }
       const doneCue = currentCue();
-      addLog('cue-completed', { seq: doneCue.seq });
+      const doneHist = state.cueHistory[doneCue.id] || { revision: 1, currentReason: null, attempts: [] };
+      const doneRevision = doneHist.revision;
+      // 已完成轮次封存为只读历史，随后旧轮次的迟到确认/定时器回调只能被拒绝
+      doneHist.attempts.push(snapshotCurrentAttempt(doneCue, 'completed', null));
+      state.cueHistory[doneCue.id] = doneHist;
+      addLog('cue-completed', { seq: doneCue.seq, revision: doneRevision, attemptId: state.attemptId });
       if (state.currentIndex + 1 >= state.sequence.length) {
         finishSequence();
       } else {
@@ -264,6 +368,8 @@ function handleMessage(ws, msg) {
       clearCueTimer();
       state.phase = 'idle';
       state.currentIndex = -1;
+      state.attemptId = null;
+      state.cueHistory = {};
       state.confirmations = {};
       state.timedOut = [];
       state.substitutions = {};
@@ -281,9 +387,23 @@ function handleMessage(ws, msg) {
       }
       const cue = currentCue();
       if (!cue) return sendError(ws, '当前没有进行中的口令');
+      const hist = cueHistoryOf(cue);
+      const revision = hist ? hist.revision : 1;
+      // 旧轮次确认（迟到到达）：attemptId 与当前轮次不符，只拒绝并记录，绝不污染新轮次
+      if (!data.attemptId || data.attemptId !== state.attemptId) {
+        addLog('stale-confirm-ignored', {
+          seq: cue.seq,
+          position: meta.position,
+          sentAttemptId: data.attemptId || null,
+          currentAttemptId: state.attemptId,
+          currentRevision: revision,
+        });
+        broadcastState();
+        return sendError(ws, '该确认属于已撤回/已结束的旧轮次，已被拒绝；请按最新修订版口令重新确认');
+      }
       const position = meta.position;
       if (!effectiveTargets(cue).includes(position)) {
-        // 原岗位被替岗后，确认权已移交替补，不得再确认本条
+        // 原岗位被替岗后，确认权已移交替补，不得再确认本轮
         if (cue.targets.includes(position) && state.substitutions[position]) {
           return sendError(ws, `本岗位的确认任务已移交「${state.substitutions[position].substitute}」，无需再确认`);
         }
@@ -291,7 +411,7 @@ function handleMessage(ws, msg) {
       }
       // 重复确认：实时标记进日志，不改变状态
       if (state.confirmations[position]) {
-        addLog('confirm-duplicate', { seq: cue.seq, position });
+        addLog('confirm-duplicate', { seq: cue.seq, revision, attemptId: state.attemptId, position });
         broadcastState();
         return;
       }
@@ -300,9 +420,12 @@ function handleMessage(ws, msg) {
         clientId: meta.clientId,
         at: Date.now(),
         late,
+        attemptId: state.attemptId,
       };
       if (late) state.timedOut = state.timedOut.filter((t) => t !== position);
-      addLog(late ? 'confirm-late' : 'confirm', { seq: cue.seq, position });
+      addLog(late ? 'confirm-late' : 'confirm', {
+        seq: cue.seq, revision, attemptId: state.attemptId, position,
+      });
       broadcastState();
       break;
     }
@@ -315,6 +438,16 @@ function handleMessage(ws, msg) {
       }
       const cue = currentCue();
       if (!cue) return sendError(ws, '当前没有进行中的口令');
+      // 旧轮次的替岗请求（撤回后迟到到达）：拒绝并记录
+      if (data.attemptId && data.attemptId !== state.attemptId) {
+        addLog('stale-substitute-ignored', {
+          seq: cue.seq,
+          sentAttemptId: data.attemptId || null,
+          currentAttemptId: state.attemptId,
+        });
+        broadcastState();
+        return sendError(ws, '该替岗操作属于已撤回/已结束的旧轮次，已被拒绝');
+      }
       const from = String(data.from || '').trim();
       const to = String(data.to || '').trim();
       if (!from || !to) return sendError(ws, '请指定被替岗的原岗位与替补岗位');
@@ -340,8 +473,30 @@ function handleMessage(ws, msg) {
       if (state.timedOut.includes(from)) {
         state.timedOut = state.timedOut.map((t) => (t === from ? to : t));
       }
-      addLog('position-substituted', { seq: cue.seq, from, to });
+      addLog('position-substituted', {
+        seq: cue.seq, revision: cueHistoryOf(cue).revision, attemptId: state.attemptId, from, to,
+      });
       broadcastState();
+      break;
+    }
+
+    case 'recall': {
+      // 撤回并纠正重发：仅控制端可发起，须填写撤回原因与修正版口令文本
+      const meta = ws.meta || {};
+      if (meta.role !== 'control') {
+        return sendError(ws, '仅控制端可以撤回并纠正重发口令');
+      }
+      if (state.phase !== 'active' || !currentCue()) {
+        return sendError(ws, '仅可撤回当前进行中的口令；已推进或已完成的口令不可撤回');
+      }
+      if (allConfirmed()) {
+        return sendError(ws, '当前口令已全员确认完成，不可撤回；如需更正请在下一条口令中说明');
+      }
+      const reason = String(data.reason || '').trim();
+      const newText = String(data.text || '').trim();
+      if (!reason) return sendError(ws, '请填写撤回原因');
+      if (!newText) return sendError(ws, '请填写修正版口令文本');
+      recallCue(ws, reason, newText);
       break;
     }
 

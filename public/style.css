@@ -153,6 +153,41 @@ tr.current-row td { background: #24304a; }
 
 .countdown { font-size: 15px; color: #f0c169; text-align: center; margin-top: 6px; }
 .muted { color: #7c8398; font-size: 13px; }
+
+/* 修订号 / 撤回原因 */
+.rev-badge {
+  display: inline-block;
+  margin-bottom: 10px;
+  padding: 3px 14px;
+  border-radius: 12px;
+  font-size: 13px;
+  background: #4a3a1e;
+  color: #f0c169;
+}
+.rev-badge.rev-initial { background: #2c3040; color: #8b93a8; }
+.rev-reason {
+  text-align: center;
+  color: #f0c169;
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+/* 只读历史轮次 */
+.attempt-row {
+  background: #14161c;
+  border: 1px solid #2c3040;
+  border-left: 3px solid #3a4052;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}
+.attempt-row.recalled { border-left-color: #a03a3a; }
+.attempt-row.completed { border-left-color: #2f6f4a; }
+.attempt-head { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+.attempt-text { font-size: 14px; margin-bottom: 6px; color: #c3c9d8; }
+.attempt-reason { font-size: 13px; color: #f0c169; margin-bottom: 6px; }
+.attempt-sub { font-size: 12px; color: #9aa3b8; margin-top: 6px; }
+.attempt-chips .chip { margin-bottom: 4px; }
 .home-links { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .home-links a {
   display: block;
